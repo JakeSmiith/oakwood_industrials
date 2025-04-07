@@ -1,0 +1,88 @@
+# ------------------ LIBRARIES ------------------
+library(readr)
+library(dplyr)
+library(quantmod)
+library(tidyquant)
+library(ggplot2)
+library(tidyr)
+library(broom)
+
+# ------------------ STEP 1: LOAD & FILTER ESG DATA ------------------
+
+# Load file from your Downloads folder
+esg_raw <- read_csv("C:/Users/jakes/Downloads/SP 500 ESG Risk Ratings.csv")
+
+# Clean and filter to Industrials sector
+esg_clean <- esg_raw %>%
+    filter(Sector == "Industrials") %>%
+    select(
+        Ticker = Symbol,
+        Company = Name,
+        Sector,
+        Industry,
+        ESG_Score = `Total ESG Risk score`
+    ) %>%
+    filter(!is.na(ESG_Score))
+
+cat("✅ Filtered", nrow(esg_clean), "industrial firms with ESG scores.\n")
+
+# ------------------ STEP 2: FETCH STOCK PRICE DATA ------------------
+
+fetch_prices <- function(tickers, start_date = "2015-01-01", end_date = "2025-04-1") {
+    results <- list()
+    for (ticker in tickers) {
+        cat("⏳ Fetching:", ticker, "\n")
+        tryCatch({
+            data <- getSymbols(ticker, src = "yahoo", from = start_date, to = end_date, auto.assign = FALSE)
+            adj_close <- Ad(data)
+            df <- data.frame(Date = index(adj_close), Price = coredata(adj_close))
+            names(df)[2] <- ticker
+            results[[ticker]] <- df
+        }, error = function(e) {
+            cat("⚠️ Skipping", ticker, "-", e$message, "\n")
+        })
+    }
+    if (length(results) == 0) return(data.frame())
+    combined <- Reduce(function(x, y) full_join(x, y, by = "Date"), results)
+    return(combined)
+}
+
+price_data <- fetch_prices(esg_clean$Ticker)
+price_data <- price_data %>% drop_na()
+
+# ------------------ STEP 3: CALCULATE TOTAL RETURNS ------------------
+if (nrow(price_data) > 0) {
+    first_row <- price_data[1, -1]
+    last_row <- price_data[nrow(price_data), -1]
+    total_return <- (last_row - first_row) / first_row * 100
+    
+    returns_df <- data.frame(
+        Ticker = colnames(total_return),
+        Total_Return = as.numeric(total_return)
+    )
+    
+    # Merge with ESG data
+    esg_final <- left_join(esg_clean, returns_df, by = "Ticker") %>%
+        filter(!is.na(Total_Return))
+    
+    cat("✅ Merged with returns for", nrow(esg_final), "tickers.\n")
+    
+    # ------------------ STEP 4: REGRESSION ------------------
+    model <- lm(Total_Return ~ ESG_Score, data = esg_final)
+    print(summary(model))
+    
+    # ------------------ STEP 5: VISUALISE ------------------
+    ggplot(esg_final, aes(x = ESG_Score, y = Total_Return, label = Ticker)) +
+        geom_point(colour = "#0072B2", size = 3) +
+        geom_smooth(method = "lm", se = TRUE, colour = "#D55E00", linetype = "dashed") +
+        geom_text(vjust = -0.8, size = 3) +
+        labs(
+            title = "Total Return vs ESG Score (S&P 500 Industrials)",
+            x = "ESG Risk Score",
+            y = "Total Return (%)"
+        ) +
+        theme_minimal(base_size = 14)
+    
+} else {
+    cat("⚠️ Not enough data to compute returns. Try again with more valid tickers.\n")
+}
