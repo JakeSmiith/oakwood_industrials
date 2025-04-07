@@ -1,0 +1,118 @@
+library(shiny)
+library(readr)
+library(dplyr)
+library(quantmod)
+library(tidyquant)
+library(ggplot2)
+library(tidyr)
+library(broom)
+library(bslib)
+
+# Load ESG data
+esg_raw <- read_csv("C:/Users/jakes/Downloads/SP 500 ESG Risk Ratings.csv")
+
+# Clean and filter to Industrials sector
+esg_sub <- esg_raw %>% filter(esg_raw[[4]] == "Industrials")
+
+esg_final <- data.frame(
+    Ticker      = esg_sub[[1]],
+    Company     = esg_sub[[2]],
+    Sector      = esg_sub[[4]],
+    Industry    = esg_sub[[5]],
+    ESG_Score   = as.numeric(esg_sub[[8]]),
+    Environment = as.numeric(esg_sub[[9]]),
+    Governance  = as.numeric(esg_sub[[10]]),
+    Social      = as.numeric(esg_sub[[11]])
+) %>% na.omit()
+
+# UI
+ui <- fluidPage(
+    theme = bs_theme(bootswatch = "flatly"),
+    titlePanel("ESG Risk Factors vs Stock Performance"),
+    sidebarLayout(
+        sidebarPanel(
+            selectInput("esg_factor", "Select ESG Factor:",
+                        choices = c("ESG_Score", "Environment", "Governance", "Social"),
+                        selected = "ESG_Score"),
+            dateRangeInput("daterange", "Select Date Range",
+                           start = "2015-01-01", end = Sys.Date(),
+                           min = "2010-01-01", max = Sys.Date()),
+            actionButton("run", "Run Analysis")
+        ),
+        mainPanel(
+            plotOutput("esgPlot"),
+            verbatimTextOutput("regressionSummary")
+        )
+    )
+)
+
+# Server
+server <- function(input, output) {
+    observeEvent(input$run, {
+        fetch_prices <- function(tickers, start_date, end_date) {
+            results <- list()
+            for (ticker in tickers) {
+                tryCatch({
+                    data <- getSymbols(ticker, src = "yahoo", from = start_date, to = end_date, auto.assign = FALSE)
+                    adj_close <- Ad(data)
+                    df <- data.frame(Date = index(adj_close), Price = coredata(adj_close))
+                    names(df)[2] <- ticker
+                    results[[ticker]] <- df
+                }, error = function(e) {
+                    message("Skipping ", ticker, ": ", e$message)
+                })
+            }
+            if (length(results) == 0) return(data.frame())
+            combined <- Reduce(function(x, y) full_join(x, y, by = "Date"), results)
+            return(combined)
+        }
+        
+        price_data <- fetch_prices(esg_final$Ticker, input$daterange[1], input$daterange[2])
+        price_data <- price_data %>% drop_na()
+        
+        if (nrow(price_data) > 0) {
+            first_row <- price_data[1, -1]
+            last_row <- price_data[nrow(price_data), -1]
+            total_return <- (last_row - first_row) / first_row * 100
+            
+            returns_df <- data.frame(
+                Ticker = colnames(total_return),
+                Total_Return = as.numeric(total_return)
+            )
+            
+            esg_merged <- left_join(esg_final, returns_df, by = "Ticker") %>%
+                filter(!is.na(Total_Return))
+            
+            fmla <- as.formula(paste("Total_Return ~", input$esg_factor))
+            model <- lm(fmla, data = esg_merged)
+            
+            output$esgPlot <- renderPlot({
+                ggplot(esg_merged, aes_string(x = input$esg_factor, y = "Total_Return", label = "Ticker")) +
+                    geom_point(colour = "#0072B2", size = 3) +
+                    geom_smooth(method = "lm", se = TRUE, colour = "#D55E00", linetype = "dashed") +
+                    geom_text(vjust = -0.8, size = 3) +
+                    labs(
+                        title = paste("Total Return vs", input$esg_factor),
+                        x = input$esg_factor,
+                        y = "Total Return (%)"
+                    ) +
+                    theme_minimal(base_size = 14)
+            })
+            
+            output$regressionSummary <- renderPrint({
+                summary(model)
+            })
+        } else {
+            output$esgPlot <- renderPlot({
+                plot.new()
+                text(0.5, 0.5, "⚠️ Not enough data to compute returns.")
+            })
+            output$regressionSummary <- renderPrint({
+                "No valid price data available."
+            })
+        }
+    })
+}
+
+# Run App
+shinyApp(ui, server)
